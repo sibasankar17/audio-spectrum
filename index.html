@@ -73,8 +73,11 @@
 
   .np-visual{position:relative}
   .np-head{display:flex;align-items:center;gap:.75rem;margin-bottom:.7rem}
+  .np-cover{width:36px;height:36px;border-radius:6px;object-fit:cover;display:none;flex:none}
+  .np-cover.show{display:block}
+  .np-meta{display:flex;flex-direction:column;flex:1;min-width:0;justify-content:center}
   .np-eyebrow{font-family:var(--mono);font-size:.66rem;letter-spacing:.18em;color:var(--accent);text-transform:uppercase}
-  .np-name{font-weight:700;font-size:1.05rem;line-height:1.2;flex:1;min-width:0;word-break:break-word}
+  .np-name{font-weight:700;font-size:1.05rem;line-height:1.2;min-width:0;word-break:break-word}
   .np-zonepill{font-family:var(--mono);font-size:.66rem;padding:.15rem .5rem;border-radius:999px;
     border:1px solid var(--npc);color:var(--npc);white-space:nowrap}
 
@@ -308,8 +311,11 @@
     <div class="np-grid">
       <div class="np-visual">
         <div class="np-head">
-          <span class="np-eyebrow">Now Playing</span>
-          <span class="np-name" id="npName">—</span>
+          <img class="np-cover" id="npCover" alt="">
+          <div class="np-meta">
+            <span class="np-eyebrow">Now Playing</span>
+            <span class="np-name" id="npName">—</span>
+          </div>
           <span class="np-zonepill" id="npZone">—</span>
         </div>
         <canvas class="scope" id="scope"></canvas>
@@ -317,10 +323,14 @@
           <button class="viz-tab active" data-viz="spectrum">Spectrum</button>
           <button class="viz-tab" data-viz="radial">Radial</button>
           <button class="viz-tab" data-viz="spectrogram">Spectrogram</button>
+          <button class="viz-tab" data-viz="bars">Bars</button>
+          <button class="viz-tab" data-viz="waveform">Waveform</button>
           <button class="viz-tab" data-viz="timeline">Session timeline</button>
         </div>
         <canvas class="mainviz" id="mainViz"></canvas>
         <div class="transport">
+          <button class="tbtn" id="shuffleBtn" title="Shuffle">🔀</button>
+          <button class="tbtn" id="repeatBtn" title="Repeat All">🔁</button>
           <button class="tbtn" id="prevBtn" title="Previous">⏮</button>
           <button class="tbtn main" id="playBtn" title="Play / pause">▶</button>
           <button class="tbtn" id="nextBtn" title="Next">⏭</button>
@@ -472,7 +482,8 @@ const board = $('#board'), player = $('#player'), fileInput = $('#fileInput'), d
 
 /* ---------- persistence: IndexedDB (cache + library) + localStorage (prefs/log) ---------- */
 const FEATURE_KEYS=['energies','centroid','zone','confidence','key','keyConf','bpm','bpmConf',
-  'flatness','texture','rolloff','dynamicRange','brightness','duration','sampleRate','channels'];
+  'flatness','texture','rolloff','dynamicRange','brightness','duration','sampleRate','channels',
+  'title','artist','album','cover'];
 const ANALYSIS_VERSION=2; // bump when the analysis math changes, to invalidate stale cache entries
 function fileSig(f){ return `${f.name}|${f.size}|${f.lastModified||0}`; }
 function nsKey(f){ return `${f.name}|${f.size}`; }            // content key (independent of file timestamp)
@@ -507,6 +518,11 @@ const LS={ get(k,d){ try{const v=localStorage.getItem(k);return v==null?d:JSON.p
 
 async function persistAnalysis(it){
   await idbPut('analysisCache', it.sig, {v:ANALYSIS_VERSION, ...featuresOf(it)});
+  // Note: we don't store blob urls like it.cover in indexedDB because they won't work on reload,
+  // we could store the actual arraybuffer, but for simplicity we'll just let the UI re-parse them
+  // or they'll just re-fetch it from the file when it is dragged back in.
+  const itToSave = { ...it };
+  delete itToSave.cover;
   await idbPut('library', it.sig, {sig:it.sig, name:it.name, path:it.path,
     zone:it.zone, zones:it.zones||null, zonesManual:!!it.zonesManual, manual:!!it.manual,
     cues:it.cues||[null,null,null], av:ANALYSIS_VERSION, addedAt:it.addedAt||Date.now(), ...featuresOf(it)});
@@ -699,7 +715,94 @@ function analyzeCore(mono, sr, dur, ch){
 /* ---------- file queue ---------- */
 let seen=new Set(), byNS=new Map();
 const isAudio=f=>f.type.startsWith('audio/')||/\.(m4a|mp3|wav|aac|ogg|flac|opus|aif|aiff|m4b|3gp|caf|weba)$/i.test(f.name);
-function attachFile(it,f){ it.file=f; it.url=URL.createObjectURL(f); it.nofile=false; }
+
+function decodeString(buffer, encoding) {
+  try {
+    if (encoding === 0) return new TextDecoder('iso-8859-1').decode(buffer).replace(/\0/g, '');
+    if (encoding === 1) return new TextDecoder('utf-16').decode(buffer).replace(/\0/g, '');
+    if (encoding === 2) return new TextDecoder('utf-16be').decode(buffer).replace(/\0/g, '');
+    if (encoding === 3) return new TextDecoder('utf-8').decode(buffer).replace(/\0/g, '');
+  } catch(e) {}
+  return '';
+}
+
+async function attachFile(it,f){
+  it.file=f; it.url=URL.createObjectURL(f); it.nofile=false;
+  try {
+    const tags = await parseID3(f);
+    if(tags.title) it.title = tags.title;
+    if(tags.artist) it.artist = tags.artist;
+    if(tags.album) it.album = tags.album;
+    if(tags.cover) it.cover = tags.cover;
+  } catch(e) {}
+}
+
+function parseID3(file) {
+  return new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onload = function(e) {
+      const buffer = e.target.result;
+      const view = new DataView(buffer);
+      const tags = { title: null, artist: null, album: null, cover: null };
+      if (view.byteLength < 10) return resolve(tags);
+      if (view.getUint8(0) !== 0x49 || view.getUint8(1) !== 0x44 || view.getUint8(2) !== 0x33) {
+        return resolve(tags);
+      }
+      const version = view.getUint8(3);
+      const flags = view.getUint8(5);
+      const size = (view.getUint8(6) << 21) | (view.getUint8(7) << 14) | (view.getUint8(8) << 7) | view.getUint8(9);
+      let offset = 10;
+      if (flags & 0x40) {
+        const extSize = view.getUint32(offset);
+        offset += (version === 4 ? ((view.getUint8(offset) << 21) | (view.getUint8(offset+1) << 14) | (view.getUint8(offset+2) << 7) | view.getUint8(offset+3)) : extSize);
+      }
+      while (offset < size && offset < view.byteLength) {
+        if (view.getUint8(offset) === 0) break;
+        const frameId = String.fromCharCode(view.getUint8(offset), view.getUint8(offset+1), view.getUint8(offset+2), view.getUint8(offset+3));
+        let frameSize;
+        if (version === 4) {
+          frameSize = (view.getUint8(offset+4) << 21) | (view.getUint8(offset+5) << 14) | (view.getUint8(offset+6) << 7) | view.getUint8(offset+7);
+        } else {
+          frameSize = view.getUint32(offset+4);
+        }
+        offset += 10;
+        try {
+          if (offset + frameSize > view.byteLength) {
+            offset += frameSize;
+            continue;
+          }
+          if (frameId === 'TIT2' || frameId === 'TPE1' || frameId === 'TALB') {
+            const encoding = view.getUint8(offset);
+          const textBuf = new Uint8Array(buffer, offset + 1, frameSize - 1);
+          const text = decodeString(textBuf, encoding);
+          if (frameId === 'TIT2') tags.title = text;
+          if (frameId === 'TPE1') tags.artist = text;
+          if (frameId === 'TALB') tags.album = text;
+        } else if (frameId === 'APIC') {
+          const encoding = view.getUint8(offset);
+          let p = offset + 1;
+          let mime = '';
+          while (view.getUint8(p) !== 0 && p < offset + frameSize) { mime += String.fromCharCode(view.getUint8(p)); p++; }
+          p++;
+          const picType = view.getUint8(p); p++;
+          if (encoding === 1 || encoding === 2) { while ((view.getUint8(p) !== 0 || view.getUint8(p+1) !== 0) && p < offset + frameSize) p += 2; p += 2; }
+          else { while (view.getUint8(p) !== 0 && p < offset + frameSize) p++; p++; }
+          if (p < offset + frameSize) {
+              const imgData = new Uint8Array(buffer, p, frameSize - (p - offset));
+              const blob = new Blob([imgData], { type: mime || 'image/jpeg' });
+              tags.cover = URL.createObjectURL(blob);
+            }
+          }
+        } catch(e) {}
+        offset += frameSize;
+      }
+      resolve(tags);
+    };
+    reader.onerror = () => resolve({ title: null, artist: null, album: null, cover: null });
+    reader.readAsArrayBuffer(file.slice(0, 512 * 1024));
+  });
+}
+
 
 async function addFiles(list){
   const files=[...list].filter(isAudio);
@@ -715,15 +818,16 @@ async function addFiles(list){
     const sig=fileSig(f), ns=nsKey(f);
     const existing = (seen.has(sig) && items.find(i=>i.sig===sig)) || byNS.get(ns);
     if(existing){
-      if(!existing.file){ attachFile(existing,f); added++; relinked++; }  // re-link, no re-processing
+      if(!existing.file){ await attachFile(existing,f); added++; relinked++; }  // re-link, no re-processing
       if((existing.av||1)!==ANALYSIS_VERSION && existing.file){            // stale analysis → recompute with improved detection
         existing.status='queued'; existing.cached=false; restale++;
       }
       continue;
     }
     seen.add(sig);
+    const tags = await parseID3(f);
     const it={id:++idCounter, sig, name:f.name, path:f.webkitRelativePath||f.name,
-      file:f, url:URL.createObjectURL(f), status:'queued', zone:null, energies:null, addedAt:Date.now(), cues:[null,null,null]};
+      file:f, url:URL.createObjectURL(f), status:'queued', zone:null, energies:null, addedAt:Date.now(), cues:[null,null,null], ...tags};
     byNS.set(ns, it);
     const cached=cacheBySig.get(sig) || cacheByNS.get(ns);
     if(cached && cached.v===ANALYSIS_VERSION){ Object.assign(it,cached); it.sig=sig; it.av=ANALYSIS_VERSION; it.status='done'; it.cached=true; persistAnalysis(it); fromCache++; }
@@ -886,6 +990,18 @@ function ensureGraph(){
 }
 
 /* ---------- playback / playlist ---------- */
+let shuffleMode=false, repeatMode=0; // 0=off, 1=all, 2=one
+$('#shuffleBtn').addEventListener('click', e => {
+  shuffleMode = !shuffleMode;
+  e.target.classList.toggle('active', shuffleMode);
+});
+$('#repeatBtn').addEventListener('click', e => {
+  repeatMode = (repeatMode + 1) % 3;
+  e.target.classList.toggle('active', repeatMode > 0);
+  e.target.textContent = repeatMode === 2 ? '🔂' : '🔁';
+  e.target.title = repeatMode === 2 ? 'Repeat One' : repeatMode === 1 ? 'Repeat All' : 'Repeat Off';
+});
+
 function playlist(){ const out=[]; ZONES.forEach(z=>items.filter(i=>i.status==='done'&&i.file&&i.zone===z.id).forEach(i=>out.push(i.id))); return out; }
 function loadTrack(id, autoplay=true){
   const it=items.find(i=>i.id===id); if(!it||it.status!=='done') return;
@@ -905,12 +1021,22 @@ function togglePlay(id){
 function step(dir){
   const pl=playlist(); if(!pl.length) return;
   const idx=pl.indexOf(currentId);
-  const next=idx<0?0:(idx+dir+pl.length)%pl.length;
+  let next = idx;
+  if(shuffleMode && dir===1 && pl.length>1){
+    do { next = Math.floor(Math.random()*pl.length); } while(next===idx);
+  } else {
+    next = idx<0 ? 0 : (idx+dir+pl.length)%pl.length;
+    if(repeatMode===0 && dir===1 && next<=idx) { player.pause(); player.currentTime=0; return; }
+  }
   loadTrack(pl[next]);
 }
 player.addEventListener('play', ()=>{updatePlayBtn();updateCapState();render();});
 player.addEventListener('pause',()=>{updatePlayBtn();updateCapState();persistCapture();render();});
-player.addEventListener('ended',()=>{persistCapture();step(1);});
+player.addEventListener('ended',()=>{
+  persistCapture();
+  if(repeatMode===2) { player.currentTime=0; player.play().catch(()=>{}); }
+  else { step(1); }
+});
 player.addEventListener('timeupdate',()=>{
   $('#curTime').textContent=fmtTime(player.currentTime);
   if(player.duration){ if(!seeking) $('#seek').value=Math.round(player.currentTime/player.duration*1000); }
@@ -921,7 +1047,10 @@ player.addEventListener('loadedmetadata',()=>{ $('#durTime').textContent=fmtTime
 function showNowPlaying(it){
   npPanel.classList.add('show');
   npPanel.style.setProperty('--npc', ZONES[it.zone].color);
-  $('#npName').textContent=it.name;
+  $('#npName').textContent=(it.artist && it.title) ? it.artist + ' - ' + it.title : it.name;
+  const cover = $('#npCover');
+  if (it.cover) { cover.src = it.cover; cover.classList.add('show'); }
+  else { cover.classList.remove('show'); cover.removeAttribute('src'); }
   $('#npZone').textContent=ZONES[it.zone].name;
   $('#aKey').innerHTML = it.keyConf>0.55 ? it.key : it.key+' <small>?</small>';
   $('#aBpm').innerHTML = it.bpmConf>0.12 && it.bpm ? it.bpm+' <small>BPM</small>' : '— <small>n/a</small>';
@@ -1178,6 +1307,35 @@ function draw(){
     mctx.fillStyle='rgba(255,255,255,.5)'; mctx.font=`${10*dpr}px monospace`;
     [100,1000,10000].forEach(f=>{ if(f>fMax)return; const y=(1-Math.log2(f/fMin)/logSpan)*H;
       mctx.fillText(f>=1000?(f/1000)+'k':f+'', 4*dpr, y-2*dpr); });
+  } else if(mainMode==='bars'){
+    const bands = 32;
+    const bw = W / bands;
+    if(peaks.length!==bands) peaks=new Float32Array(bands);
+    for(let b=0; b<bands; b++){
+      const f0=fMin*Math.pow(2,(b/bands)*logSpan), f1=fMin*Math.pow(2,((b+1)/bands)*logSpan);
+      let i0=Math.floor(f0/nyq*N), i1=Math.max(i0+1,Math.floor(f1/nyq*N));
+      let m=0; for(let i=i0; i<i1&&i<N; i++) if(freq[i]>m) m=freq[i];
+      const val=(m/255); const h=val*H; const hue=(b/bands)*270;
+      mctx.fillStyle=`hsl(${hue},100%,55%)`;
+      mctx.fillRect(b*bw+2, H-h, bw-4, h);
+      peaks[b] = Math.max(val, peaks[b]-0.012);
+      mctx.fillStyle=`hsl(${hue},100%,78%)`;
+      mctx.fillRect(b*bw+2, H-peaks[b]*H-3*dpr, bw-4, 3*dpr);
+    }
+  } else if(mainMode==='waveform'){
+    mctx.fillStyle = 'rgba(0, 240, 255, 0.2)';
+    mctx.beginPath();
+    mctx.moveTo(0, H/2);
+    const slice = W / time.length;
+    for(let i=0; i<time.length; i++){
+      const v = time[i]/128 - 1;
+      const y = H/2 + v * H/2;
+      mctx.lineTo(i * slice, y);
+    }
+    mctx.lineTo(W, H/2);
+    mctx.fill();
+    mctx.strokeStyle = 'rgba(0, 240, 255, 0.9)';
+    mctx.stroke();
   } else {
     drawTimeline(W,H,dpr);
   }
@@ -1398,9 +1556,9 @@ function makeCard(it,compact,zoneCtx){
     c.addEventListener('click',e=>{ if(e.target.closest('.zx'))return; loadTrack(it.id); });
   }
   if(compact) c.style.width='240px';
-  if(it.status==='queued'){ c.innerHTML=`<div class="row1"><span class="fname">${esc(it.name)}</span></div><div class="analyzing" style="margin-top:.4rem">queued…</div>`; return c; }
-  if(it.status==='analyzing'){ c.innerHTML=`<div class="row1"><span class="fname">${esc(it.name)}</span></div><div class="analyzing" style="margin-top:.4rem"><span class="spin"></span>analyzing</div>`; return c; }
-  if(it.status==='error'){ c.innerHTML=`<div class="row1"><span class="fname">${esc(it.name)}</span></div><div class="err" style="margin-top:.4rem">⚠ ${esc(it.error)}</div>`; return c; }
+  if(it.status==='queued'){ c.innerHTML=`<div class="row1"><span class="fname">${esc((it.artist && it.title) ? it.artist + ' - ' + it.title : it.name)}</span></div><div class="analyzing" style="margin-top:.4rem">queued…</div>`; return c; }
+  if(it.status==='analyzing'){ c.innerHTML=`<div class="row1"><span class="fname">${esc((it.artist && it.title) ? it.artist + ' - ' + it.title : it.name)}</span></div><div class="analyzing" style="margin-top:.4rem"><span class="spin"></span>analyzing</div>`; return c; }
+  if(it.status==='error'){ c.innerHTML=`<div class="row1"><span class="fname">${esc((it.artist && it.title) ? it.artist + ' - ' + it.title : it.name)}</span></div><div class="err" style="margin-top:.4rem">⚠ ${esc(it.error)}</div>`; return c; }
   const bars=it.energies.map((v,z)=>`<span style="height:${Math.max(6,v*100)}%;background:${ZONES[z].hex}"></span>`).join('');
   const playGlyph=(currentId===it.id&&!player.paused)?'❚❚':'▶';
   const nZones=(groupMode==='zone')?zonesOf(it).length:0;
@@ -1411,7 +1569,7 @@ function makeCard(it,compact,zoneCtx){
   c.innerHTML=`
     <div class="row1">
       <button class="play" title="${it.nofile?'Re-add file to play':'Play / pause'}" ${it.nofile?'disabled style="opacity:.4;cursor:not-allowed"':''}>${playGlyph}</button>
-      <span class="fname">${esc(it.name)}${multi}${cached}${nofile}${it.zonesManual&&groupMode==='zone'?' <span style="color:var(--dim);font-family:var(--mono);font-size:.62rem">·edited</span>':''}</span>
+      <span class="fname">${esc((it.artist && it.title) ? it.artist + ' - ' + it.title : it.name)}${multi}${cached}${nofile}${it.zonesManual&&groupMode==='zone'?' <span style="color:var(--dim);font-family:var(--mono);font-size:.62rem">·edited</span>':''}</span>
       ${zx}
     </div>
     <div class="meta">
