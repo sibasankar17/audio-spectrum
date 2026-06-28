@@ -68,6 +68,8 @@
     border:1px solid var(--line);border-radius:16px;padding:1.1rem 1.1rem 1.2rem;margin-bottom:1.5rem;
     box-shadow:0 18px 50px rgba(0,0,0,.45)}
   #nowplaying.show{display:block}
+  #nowplaying:fullscreen{width:100vw;height:100vh;margin:0;border-radius:0;border:none;display:flex;flex-direction:column;justify-content:center}
+  #nowplaying:fullscreen .np-grid{max-width:1400px;margin:0 auto;width:100%}
   .np-grid{display:grid;grid-template-columns:1.55fr 1fr;gap:1.1rem}
   @media(max-width:880px){.np-grid{grid-template-columns:1fr}}
 
@@ -87,7 +89,7 @@
     background:transparent;border:none;border-bottom:2px solid transparent;padding:.4rem .3rem;cursor:pointer;transition:.12s}
   .viz-tab:hover{color:var(--text)}
   .viz-tab.active{color:var(--accent);border-bottom-color:var(--accent)}
-  canvas.mainviz{width:100%;height:210px;display:block;background:#08080b;border-radius:0 0 8px 8px;border-top:1px solid #000}
+  canvas.mainviz{width:100%;height:210px;display:block;background:#08080b;border-radius:0 0 8px 8px;border-top:1px solid #000;cursor:pointer}
 
   .transport{display:flex;align-items:center;gap:.7rem;margin-top:.7rem}
   .tbtn{width:38px;height:38px;border-radius:9px;border:1px solid var(--line);background:var(--panel-2);
@@ -144,6 +146,9 @@
   .meter-title{font-family:var(--mono);font-size:.6rem;letter-spacing:.12em;color:var(--dim);text-transform:uppercase;margin-bottom:.5rem}
   .zone-meters{display:flex;gap:.5rem;align-items:flex-end;height:62px}
   .zm{flex:1;display:flex;flex-direction:column;align-items:center;gap:.3rem;height:100%}
+  .zm{cursor:pointer;transition:0.15s}
+  .zm:hover{transform:translateY(-2px)}
+  .zm.muted .bar i{filter:grayscale(1);opacity:0.2}
   .zm .bar{width:100%;flex:1;background:#0d0d12;border-radius:4px;position:relative;overflow:hidden}
   .zm .bar i{position:absolute;left:0;right:0;bottom:0;height:0%;border-radius:4px;transition:height .06s linear}
   .zm .lbl{font-family:var(--mono);font-size:.6rem;color:var(--dim)}
@@ -194,9 +199,10 @@
 
   .card{background:var(--panel-2);border:1px solid var(--line);border-radius:10px;padding:.6rem .65rem;cursor:grab;transition:.13s ease;position:relative;animation:cardIn .25s ease}
   @keyframes cardIn{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+  @keyframes pulseBorder { 0% { box-shadow: 0 0 0 1px var(--accent); } 50% { box-shadow: 0 0 10px 2px var(--accent); } 100% { box-shadow: 0 0 0 1px var(--accent); } }
   .card:hover{border-color:rgba(255,255,255,.2);transform:translateY(-2px);box-shadow:0 6px 18px rgba(0,0,0,.3)}
   .card.dragging{opacity:.4}
-  .card.current{border-color:var(--accent);box-shadow:0 0 0 1px var(--accent)}
+  .card.current{border-color:var(--accent);animation:pulseBorder 2s infinite}
   .card.nofile{opacity:.62}
   .cached-badge{font-family:var(--mono);font-size:.55rem;color:var(--accent);border:1px solid rgba(0,240,255,.4);
     padding:.05rem .3rem;border-radius:4px;margin-left:.35rem;vertical-align:middle}
@@ -325,6 +331,8 @@
           <button class="viz-tab" data-viz="spectrogram">Spectrogram</button>
           <button class="viz-tab" data-viz="bars">Bars</button>
           <button class="viz-tab" data-viz="waveform">Waveform</button>
+          <button class="viz-tab" data-viz="particles">Particles</button>
+          <button class="viz-tab" id="fsBtn" title="Toggle Fullscreen">⛶</button>
           <button class="viz-tab" data-viz="timeline">Session timeline</button>
         </div>
         <canvas class="mainviz" id="mainViz"></canvas>
@@ -488,7 +496,7 @@ const ANALYSIS_VERSION=2; // bump when the analysis math changes, to invalidate 
 function fileSig(f){ return `${f.name}|${f.size}|${f.lastModified||0}`; }
 function nsKey(f){ return `${f.name}|${f.size}`; }            // content key (independent of file timestamp)
 function nsFromSig(sig){ const p=String(sig).split('|'); p.pop(); const size=p.pop(); return p.join('|')+'|'+size; }
-function featuresOf(it){ const o={}; FEATURE_KEYS.forEach(k=>o[k]=it[k]); return o; }
+function featuresOf(it){ const o={}; FEATURE_KEYS.forEach(k=>{ if(k!=='cover') o[k]=it[k]; }); return o; }
 
 let DB=null, dbReady=false;
 function idbOpen(){ return new Promise((res,rej)=>{
@@ -977,16 +985,28 @@ function ensureGraph(){
   if(graph) return;
   const src=audioCtx.createMediaElementSource(player);
   const gain=audioCtx.createGain(); gain.gain.value=1;
+
+  const muteNodes = ZONES.map(z => {
+    const n = audioCtx.createBiquadFilter();
+    n.type = 'peaking';
+    n.frequency.value = (z.lo + z.hi) / 2;
+    n.Q.value = 0.5;
+    n.gain.value = 0;
+    return n;
+  });
+
   // multi-band EQ (layered peaking filters) inserted before the shape filter
   const eq=EQ_BANDS.map(b=>{ const n=audioCtx.createBiquadFilter(); n.type='peaking';
     n.frequency.value=b.f; n.Q.value=1.1; n.gain.value=0; return n; });
   const filter=audioCtx.createBiquadFilter(); filter.type='allpass'; filter.frequency.value=1000; filter.Q.value=1;
   const an=audioCtx.createAnalyser();
   an.fftSize=8192; an.smoothingTimeConstant=0.82;
-  // source -> gain -> [EQ bands] -> shape filter -> analyser -> destination
-  let node=gain; src.connect(gain); eq.forEach(n=>{ node.connect(n); node=n; }); node.connect(filter);
+  // source -> gain -> [muteNodes] -> [EQ bands] -> shape filter -> analyser -> destination
+  let node=gain; src.connect(gain);
+  muteNodes.forEach(n => { node.connect(n); node = n; });
+  eq.forEach(n=>{ node.connect(n); node=n; }); node.connect(filter);
   filter.connect(an); an.connect(audioCtx.destination);
-  graph={src,gain,eq,filter,an,freq:new Uint8Array(an.frequencyBinCount),time:new Uint8Array(an.fftSize),fdb:new Float32Array(an.frequencyBinCount)};
+  graph={src,gain,muteNodes,eq,filter,an,freq:new Uint8Array(an.frequencyBinCount),time:new Uint8Array(an.fftSize),fdb:new Float32Array(an.frequencyBinCount)};
 }
 
 /* ---------- playback / playlist ---------- */
@@ -1065,12 +1085,19 @@ function showNowPlaying(it){
   buildZoneMeters(); applyFX(); renderCues(); renderSeekMarkers();
 }
 let zmBars=[];
+let mutedZones = new Set();
 function buildZoneMeters(){
   const c=$('#zoneMeters'); if(zmBars.length) return;
   c.innerHTML='';
-  ZONES.forEach(z=>{
+  ZONES.forEach((z, i)=>{
     const d=document.createElement('div'); d.className='zm';
+    if(mutedZones.has(i)) d.classList.add('muted');
     d.innerHTML=`<div class="bar"><i style="background:${z.hex}"></i></div><div class="lbl">${z.short}</div>`;
+    d.addEventListener('click', () => {
+      const active = d.classList.toggle('muted');
+      if (active) mutedZones.add(i); else mutedZones.delete(i);
+      if(graph && graph.muteNodes) graph.muteNodes[i].gain.value = active ? -40 : 0;
+    });
     c.appendChild(d); zmBars.push(d.querySelector('i'));
   });
 }
@@ -1163,6 +1190,17 @@ document.querySelectorAll('.cue-btn').forEach(b=>{
   b.addEventListener('contextmenu',e=>{ e.preventDefault(); cueClear(+b.dataset.cue); });
 });
 
+$('#fsBtn').addEventListener('click', () => {
+  if(document.fullscreenElement) document.exitFullscreen();
+  else npPanel.requestFullscreen();
+});
+
+$('#mainViz').addEventListener('click', e => {
+  if(player.duration) {
+    player.currentTime = (e.offsetX / $('#mainViz').clientWidth) * player.duration;
+  }
+});
+
 /* ---------- live draw loop ---------- */
 const mainViz=$('#mainViz'), mctx=mainViz.getContext('2d');
 const scope=$('#scope'), scctx=scope.getContext('2d');
@@ -1222,6 +1260,7 @@ function exportCaptureJSON(){
 }
 
 let looping=false, frame=0;
+let particles=[];
 let peaks=new Float32Array(120);
 let lin=new Float32Array(0), pitchHist=[];
 /* Harmonic Product Spectrum: multiplies the spectrum by its 2nd/3rd harmonic-downsamples so the
@@ -1336,6 +1375,42 @@ function draw(){
     mctx.fill();
     mctx.strokeStyle = 'rgba(0, 240, 255, 0.9)';
     mctx.stroke();
+  } else if(mainMode==='particles'){
+    mctx.fillStyle = 'rgba(8,8,11,0.2)';
+    mctx.fillRect(0, 0, W, H);
+
+    // Spawn new particles based on loud frequency bins
+    for(let i=10; i<N; i+=5) {
+      if(freq[i] > 180 && Math.random() < 0.1) {
+        particles.push({
+          x: Math.log2(i*nyq/N / fMin) / logSpan * W,
+          y: H,
+          vy: -Math.random() * 3 - 1,
+          vx: (Math.random() - 0.5) * 1,
+          alpha: 1,
+          hue: (Math.log2(i*nyq/N / fMin) / logSpan) * 270
+        });
+      }
+    }
+
+    // Update and draw existing particles
+    for(let i=particles.length-1; i>=0; i--) {
+      let p = particles[i];
+      p.x += p.vx;
+      p.y += p.vy;
+      p.vy += 0.05; // gravity
+      p.alpha -= 0.01;
+
+      if(p.alpha <= 0 || p.y > H) {
+        particles.splice(i, 1);
+        continue;
+      }
+
+      mctx.beginPath();
+      mctx.arc(p.x, p.y, 2*dpr, 0, Math.PI*2);
+      mctx.fillStyle = `hsla(${p.hue}, 100%, 70%, ${p.alpha})`;
+      mctx.fill();
+    }
   } else {
     drawTimeline(W,H,dpr);
   }
@@ -1481,7 +1556,7 @@ function groupsFor(mode){
         match:it=>{const v=it.duration||0; return v>=b.lo&&v<b.hi;}}; });
   }
   if(mode==='folder'){
-    const top=it=>{ const p=it.path||it.name; return p.includes('/')?p.split('/')[0]:'(root)'; };
+    const top=it=>{ const p=it.path||it.name; return p.includes('/')?p.split('/').slice(0,-1).join('/'):'(root)'; };
     const folders=[...new Set(done.map(top))].sort();
     return folders.map((fname,i)=>{ const hue=folders.length>1?(i/folders.length)*360:200;
       return {id:'f'+i,name:fname,sub:'folder',color:hsl(hue,55,60),hex:hsl(hue,55,60),match:it=>top(it)===fname}; });
