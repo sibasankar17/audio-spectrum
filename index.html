@@ -287,6 +287,7 @@
     </select>
     <button class="btn" id="plBtn" disabled>Generate .m3u8</button>
     <button class="btn" id="exportBtn" disabled>Export (.csv)</button>
+    <button class="btn" id="organizeBtn" disabled>Organize to Disk</button>
     <button class="btn" id="clearBtn" disabled>Clear all</button>
   </div>
 
@@ -472,8 +473,8 @@ const board = $('#board'), player = $('#player'), fileInput = $('#fileInput'), d
 
 /* ---------- persistence: IndexedDB (cache + library) + localStorage (prefs/log) ---------- */
 const FEATURE_KEYS=['energies','centroid','zone','confidence','key','keyConf','bpm','bpmConf',
-  'flatness','texture','rolloff','dynamicRange','brightness','duration','sampleRate','channels'];
-const ANALYSIS_VERSION=2; // bump when the analysis math changes, to invalidate stale cache entries
+  'flatness','texture','rolloff','dynamicRange','brightness','duration','sampleRate','channels','peaks'];
+const ANALYSIS_VERSION=3; // bump when the analysis math changes, to invalidate stale cache entries
 function fileSig(f){ return `${f.name}|${f.size}|${f.lastModified||0}`; }
 function nsKey(f){ return `${f.name}|${f.size}`; }            // content key (independent of file timestamp)
 function nsFromSig(sig){ const p=String(sig).split('|'); p.pop(); const size=p.pop(); return p.join('|')+'|'+size; }
@@ -686,13 +687,28 @@ function analyzeCore(mono, sr, dur, ch){
 
   const bpm=estimateBPM(mono,sr);
 
+  // Peak decimation for waveform rendering
+  const peakCount = 100;
+  const peaks = new Float32Array(peakCount);
+  const pStep = Math.max(1, Math.floor(n / peakCount));
+  for(let p=0; p<peakCount; p++) {
+    let maxV = 0;
+    const start = p * pStep;
+    const end = Math.min(start + pStep, n);
+    for(let i=start; i<end; i++) {
+      const v = Math.abs(mono[i]);
+      if(v > maxV) maxV = v;
+    }
+    peaks[p] = maxV;
+  }
+
   return {
     energies:norm, centroid, zone, confidence,
     key:key.label, keyConf:key.conf,
     bpm:bpm.bpm, bpmConf:bpm.conf,
     flatness, texture:textureWord(flatness),
     rolloff, dynamicRange:dr, brightness:brightnessWord(centroid),
-    duration:dur, sampleRate:sr, channels:ch
+    duration:dur, sampleRate:sr, channels:ch, peaks:Array.from(peaks)
   };
 }
 
@@ -924,7 +940,7 @@ function showNowPlaying(it){
   $('#npName').textContent=it.name;
   $('#npZone').textContent=ZONES[it.zone].name;
   $('#aKey').innerHTML = it.keyConf>0.55 ? it.key : it.key+' <small>?</small>';
-  $('#aBpm').innerHTML = it.bpmConf>0.12 && it.bpm ? it.bpm+' <small>BPM</small>' : '— <small>n/a</small>';
+  $('#aBpm').innerHTML = it.bpmConf>0.12 && it.bpm ? it.bpm+' <small>BPM (' + Math.round(it.bpm/2) + ' / ' + Math.round(it.bpm*2) + ')</small>' : '— <small>n/a</small>';
   $('#aTexture').textContent=it.texture;
   $('#aZone').textContent=zonesOf(it).map(z=>ZONES[z].short).join(' · ')||ZONES[it.zone].name;
   $('#aCentroid').innerHTML=fmtHz(it.centroid).replace(/ (k?Hz)/,' <small>$1</small>');
@@ -1010,7 +1026,15 @@ function curItem(){ return items.find(i=>i.id===currentId); }
 function cueClick(idx){
   const it=curItem(); if(!it){ flashStorage('Load a track first'); return; }
   if(!it.cues) it.cues=[null,null,null];
-  if(it.cues[idx]==null){ it.cues[idx]=player.currentTime; persistAnalysis(it); }
+  if(it.cues[idx]==null){
+    let cueTime = player.currentTime;
+    if (it.bpmConf > 0.12 && it.bpm) {
+      const step = 60 / it.bpm / 4;
+      cueTime = Math.round(cueTime / step) * step;
+    }
+    it.cues[idx]=cueTime;
+    persistAnalysis(it);
+  }
   else { player.currentTime=it.cues[idx]; if(player.paused) player.play().catch(()=>{}); }
   renderCues(); renderSeekMarkers();
 }
@@ -1416,11 +1440,12 @@ function makeCard(it,compact,zoneCtx){
     </div>
     <div class="meta">
       <div class="fingerprint">${bars}</div>
-      <div class="conf">centroid <b>${fmtHz(it.centroid)}</b></div>
+      ${it.peaks ? `<svg class="waveform-svg" viewBox="0 0 100 24" preserveAspectRatio="none" style="flex:2;height:24px;margin-left:8px;opacity:0.6;"><path fill="var(--accent)" d="M0,12 ${it.peaks.map((p,i)=>`L${i},${12 - p*12}`).join(' ')} ${[...it.peaks].reverse().map((p,i)=>`L${99-i},${12 + p*12}`).join(' ')} Z"></path></svg>` : ''}
+      <div class="conf" style="flex:1;">centroid <b>${fmtHz(it.centroid)}</b></div>
     </div>
     <div class="card-data">
       <span><b>${it.key}</b>${CAMELOT[it.key]?' <span style="opacity:.6">'+CAMELOT[it.key]+'</span>':''}</span>
-      <span>${it.bpmConf>0.12&&it.bpm?'<b>'+it.bpm+'</b> BPM':'—'}</span>
+      <span>${it.bpmConf>0.12&&it.bpm?'<b>'+it.bpm+'</b> <span style="opacity:.6">(' + Math.round(it.bpm/2) + ' / ' + Math.round(it.bpm*2) + ')</span>':'—'}</span>
       <span><b>${it.texture}</b></span>
       <span>${it.brightness}</span>
     </div>`;
@@ -1430,7 +1455,7 @@ function makeCard(it,compact,zoneCtx){
 }
 function esc(s){return s.replace(/[&<>"]/g,m=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[m]));}
 function updateToolbar(){ const done=items.filter(i=>i.status==='done').length;
-  $('#exportBtn').disabled=done===0; $('#plBtn').disabled=done===0; $('#clearBtn').disabled=items.length===0; }
+  $('#exportBtn').disabled=done===0; $('#plBtn').disabled=done===0; $('#organizeBtn').disabled=done===0; $('#clearBtn').disabled=items.length===0; }
 
 /* ---------- feedback log ---------- */
 let logEntries=[];
@@ -1507,6 +1532,37 @@ function generatePlaylist(){
 $('#plBtn').addEventListener('click',generatePlaylist);
 
 /* ---------- export ---------- */
+async function organizeToDisk(){
+  if(!('showDirectoryPicker' in window)){ flashStorage('File System Access API not supported in this browser.'); return; }
+  let rootHandle;
+  try { rootHandle = await window.showDirectoryPicker({ mode: 'readwrite' }); } catch(e){ return; }
+
+  const doneItems = items.filter(i=>i.status==='done' && i.file);
+  if(!doneItems.length){ flashStorage('No completed local files to organize.'); return; }
+
+  const groups = groupsFor(groupMode);
+  let moved = 0;
+
+  for(const it of doneItems){
+    let groupName = 'Unsorted';
+    const g = groups.find(x => x.match(it));
+    if(g) groupName = g.name.replace(/[/\\?%*:|"<>]/g, '-');
+
+    try {
+      const dirHandle = await rootHandle.getDirectoryHandle(groupName, { create: true });
+      const fileHandle = await dirHandle.getFileHandle(it.name, { create: true });
+      const writable = await fileHandle.createWritable();
+      const buffer = await it.file.arrayBuffer();
+      await writable.write(buffer);
+      await writable.close();
+      await rootHandle.removeEntry(it.name);
+      moved++;
+    } catch(e){ console.error('Error organizing', it.name, e); }
+  }
+  flashStorage(`Organized ${moved} files into subfolders.`);
+}
+$('#organizeBtn').addEventListener('click', organizeToDisk);
+
 function exportCSV(){
   const rows=[['filename','zones','dominant_zone','key','bpm','texture','centroid_hz','rolloff_hz','dynamic_range_db','duration_s','sample_rate','channels','manually_edited']];
   items.filter(i=>i.status==='done').forEach(it=>{
